@@ -1,711 +1,453 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>K8s Control Plane Monitor</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Syne:wght@400;600;700;800&display=swap');
+from flask import Flask, jsonify, render_template
+from collections import deque
+import threading
+import datetime
+import random
+import time
 
-:root {
-  --bg:       #06090f;
-  --surface:  #0c1422;
-  --surface2: #101c2e;
-  --border:   #182436;
-  --accent:   #00e5ff;
-  --accent2:  #7c5cfc;
-  --accent3:  #ff4d7d;
-  --warn:     #ffaa00;
-  --success:  #00e676;
-  --text:     #ccdaee;
-  --muted:    #3d5570;
-  --glow:     0 0 30px rgba(0,229,255,0.07);
+app = Flask(__name__)
+
+# ─── Try to load real Kubernetes config ────────────────────────────────────────
+K8S_AVAILABLE = False
+v1 = apps_v1 = custom_api = autoscaling_v2 = autoscaling_v1 = None
+
+try:
+    from kubernetes import client, config
+    try:
+        config.load_incluster_config()
+    except Exception:
+        config.load_kube_config()
+
+    v1            = client.CoreV1Api()
+    apps_v1       = client.AppsV1Api()
+    custom_api    = client.CustomObjectsApi()
+    try:
+        autoscaling_v2 = client.AutoscalingV2Api()
+        HPA_V2 = True
+    except AttributeError:
+        autoscaling_v1 = client.AutoscalingV1Api()
+        HPA_V2 = False
+
+    # Quick connectivity test
+    v1.list_node(_request_timeout=3)
+    K8S_AVAILABLE = True
+    print("✅  Connected to real Kubernetes cluster")
+except Exception as e:
+    print(f"⚠️  Kubernetes not available ({e}) — using mock data")
+
+
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+def _parse_cpu(value):
+    if not value:
+        return 0.0
+    if value.endswith("n"):
+        return float(value[:-1]) / 1_000_000
+    if value.endswith("u"):
+        return float(value[:-1]) / 1_000
+    if value.endswith("m"):
+        return float(value[:-1])
+    return float(value) * 1000
+
+def _parse_memory(value):
+    if not value:
+        return 0.0
+    units = {"Ki": 1/1024, "Mi": 1, "Gi": 1024, "Ti": 1024*1024}
+    for suffix, factor in units.items():
+        if str(value).endswith(suffix):
+            return float(value[:-len(suffix)]) * factor
+    return float(value) / (1024 * 1024)
+
+def _node_metrics_raw():
+    try:
+        return custom_api.list_cluster_custom_object(
+            group="metrics.k8s.io", version="v1beta1", plural="nodes"
+        ).get("items", [])
+    except Exception:
+        return []
+
+def _pod_metrics_raw():
+    try:
+        return custom_api.list_cluster_custom_object(
+            group="metrics.k8s.io", version="v1beta1", plural="pods"
+        ).get("items", [])
+    except Exception:
+        return []
+
+
+# ─── Rolling Time-Series Buffer ────────────────────────────────────────────────
+MAX_SAMPLES = 60
+timeseries = {
+    "timestamps":  deque(maxlen=MAX_SAMPLES),
+    "cluster_cpu": deque(maxlen=MAX_SAMPLES),
+    "cluster_mem": deque(maxlen=MAX_SAMPLES),
+    "pod_count":   deque(maxlen=MAX_SAMPLES),
 }
 
-*{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
+# Seed mock timeseries with some history so charts aren't empty on load
+_base_cpu = 35.0
+_base_mem = 52.0
+_base_pods = 18
+for i in range(30):
+    _t = (datetime.datetime.utcnow() - datetime.timedelta(seconds=(30-i)*5))
+    timeseries["timestamps"].append(_t.strftime("%H:%M:%S"))
+    timeseries["cluster_cpu"].append(round(_base_cpu + random.uniform(-5, 5), 1))
+    timeseries["cluster_mem"].append(round(_base_mem + random.uniform(-3, 3), 1))
+    timeseries["pod_count"].append(_base_pods + random.randint(-2, 2))
 
-body{
-  background:var(--bg);
-  color:var(--text);
-  font-family:'JetBrains Mono',monospace;
-  font-size:13px;
-  min-height:100vh;
-  overflow-x:hidden;
-}
 
-/* Grid background */
-body::before{
-  content:'';
-  position:fixed;inset:0;z-index:0;
-  background-image:
-    linear-gradient(rgba(0,229,255,0.015) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(0,229,255,0.015) 1px,transparent 1px);
-  background-size:48px 48px;
-  pointer-events:none;
-}
+def _collect_timeseries():
+    while True:
+        try:
+            if K8S_AVAILABLE:
+                node_items  = _node_metrics_raw()
+                nodes_list  = v1.list_node()
+                pod_items   = _pod_metrics_raw()
+                total_cpu   = sum(_parse_cpu(n["usage"]["cpu"]) for n in node_items)
+                total_mem   = sum(_parse_memory(n["usage"]["memory"]) for n in node_items)
+                alloc_cpu   = sum(_parse_cpu(n.status.allocatable.get("cpu","0")) for n in nodes_list.items) or 1
+                alloc_mem   = sum(_parse_memory(n.status.allocatable.get("memory","0")) for n in nodes_list.items) or 1
+                cpu_pct     = round(total_cpu / alloc_cpu * 100, 1)
+                mem_pct     = round(total_mem / alloc_mem * 100, 1)
+                pod_cnt     = len(pod_items)
+            else:
+                # Smooth mock random walk
+                prev_cpu = timeseries["cluster_cpu"][-1] if timeseries["cluster_cpu"] else 35.0
+                prev_mem = timeseries["cluster_mem"][-1] if timeseries["cluster_mem"] else 52.0
+                prev_pod = timeseries["pod_count"][-1]   if timeseries["pod_count"]   else 18
+                cpu_pct  = round(max(5, min(95, prev_cpu + random.uniform(-3, 3))), 1)
+                mem_pct  = round(max(10, min(90, prev_mem + random.uniform(-2, 2))), 1)
+                pod_cnt  = max(10, min(40, prev_pod + random.randint(-1, 1)))
 
-/* Glow blobs */
-body::after{
-  content:'';
-  position:fixed;inset:0;z-index:0;
-  background:
-    radial-gradient(ellipse 600px 400px at 20% 20%, rgba(0,229,255,0.03), transparent),
-    radial-gradient(ellipse 500px 400px at 80% 80%, rgba(124,92,252,0.04), transparent);
-  pointer-events:none;
-}
+            timeseries["timestamps"].append(datetime.datetime.utcnow().strftime("%H:%M:%S"))
+            timeseries["cluster_cpu"].append(cpu_pct)
+            timeseries["cluster_mem"].append(mem_pct)
+            timeseries["pod_count"].append(pod_cnt)
+        except Exception:
+            pass
+        time.sleep(5)
 
-/* ── Header ─────────────────────────────────────────────────── */
-header{
-  position:sticky;top:0;z-index:200;
-  background:rgba(6,9,15,0.9);
-  backdrop-filter:blur(16px);
-  border-bottom:1px solid var(--border);
-  height:54px;
-  padding:0 28px;
-  display:flex;align-items:center;justify-content:space-between;
-}
+threading.Thread(target=_collect_timeseries, daemon=True).start()
 
-.logo{
-  font-family:'Syne',sans-serif;
-  font-weight:800;font-size:16px;
-  color:var(--accent);
-  display:flex;align-items:center;gap:10px;
-  letter-spacing:0.04em;
-}
-.logo-icon{
-  width:30px;height:30px;
-  background:linear-gradient(135deg,var(--accent),var(--accent2));
-  clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);
-  display:flex;align-items:center;justify-content:center;
-  font-size:10px;font-weight:800;color:#000;font-family:'Syne',sans-serif;
-}
 
-.header-right{display:flex;align-items:center;gap:20px}
-
-.mode-badge{
-  padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;
-  letter-spacing:0.1em;text-transform:uppercase;
-}
-.mode-live{background:rgba(0,230,118,0.12);color:var(--success);border:1px solid rgba(0,230,118,0.2)}
-.mode-mock{background:rgba(255,170,0,0.12);color:var(--warn);border:1px solid rgba(255,170,0,0.2)}
-
-.live-indicator{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--success)}
-.live-dot{
-  width:7px;height:7px;border-radius:50%;
-  background:var(--success);
-  animation:pulse 2s ease-in-out infinite;
-}
-@keyframes pulse{
-  0%,100%{box-shadow:0 0 0 0 rgba(0,230,118,0.6)}
-  50%{box-shadow:0 0 0 6px rgba(0,230,118,0)}
-}
-#refresh-time{font-size:11px;color:var(--muted)}
-
-/* ── Layout ──────────────────────────────────────────────────── */
-main{
-  position:relative;z-index:1;
-  max-width:1680px;margin:0 auto;
-  padding:22px 28px 60px;
-  display:flex;flex-direction:column;gap:28px;
-}
-
-/* ── Section label ───────────────────────────────────────────── */
-.sec{
-  font-family:'Syne',sans-serif;
-  font-size:10px;font-weight:700;
-  letter-spacing:0.22em;text-transform:uppercase;
-  color:var(--muted);
-  margin-bottom:14px;
-  display:flex;align-items:center;gap:10px;
-}
-.sec span{font-size:14px}
-.sec::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--border),transparent)}
-
-/* ── Action buttons ──────────────────────────────────────────── */
-.actions{display:flex;gap:10px;flex-wrap:wrap}
-.btn{
-  padding:9px 20px;border-radius:8px;
-  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;
-  letter-spacing:0.05em;text-transform:uppercase;
-  cursor:pointer;border:1px solid;
-  display:inline-flex;align-items:center;gap:7px;
-  transition:all .15s;position:relative;overflow:hidden;
-  background:transparent;
-}
-.btn::before{content:'';position:absolute;inset:0;background:currentColor;opacity:0;transition:opacity .15s}
-.btn:hover::before{opacity:0.08}
-.btn:active{transform:scale(0.97)}
-.btn-hpa  {color:var(--warn);  border-color:rgba(255,170,0,0.4)}
-.btn-node {color:var(--accent3);border-color:rgba(255,77,125,0.4)}
-.btn-stop {color:var(--success);border-color:rgba(0,230,118,0.4)}
-.btn-ref  {color:var(--accent); border-color:rgba(0,229,255,0.4)}
-
-/* ── Overview cards ──────────────────────────────────────────── */
-.ov-grid{
-  display:grid;
-  grid-template-columns:repeat(8,1fr);
-  gap:12px;
-}
-@media(max-width:1400px){.ov-grid{grid-template-columns:repeat(4,1fr)}}
-@media(max-width:700px) {.ov-grid{grid-template-columns:repeat(2,1fr)}}
-
-.ov-card{
-  background:var(--surface);
-  border:1px solid var(--border);
-  border-radius:10px;
-  padding:18px 16px 14px;
-  position:relative;overflow:hidden;
-  box-shadow:var(--glow);
-  transition:border-color .2s,transform .2s;
-}
-.ov-card:hover{border-color:rgba(0,229,255,0.3);transform:translateY(-2px)}
-.ov-card::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:2px;
-  border-radius:2px 2px 0 0;
-}
-.ov-card.c-default::before{background:linear-gradient(90deg,var(--accent),var(--accent2))}
-.ov-card.c-ok::before    {background:linear-gradient(90deg,var(--success),var(--accent))}
-.ov-card.c-warn::before  {background:linear-gradient(90deg,var(--warn),var(--accent3))}
-.ov-card.c-error::before {background:var(--accent3)}
-
-.ov-label{font-size:9px;letter-spacing:0.18em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
-.ov-val{
-  font-family:'Syne',sans-serif;font-size:36px;font-weight:800;line-height:1;
-}
-.ov-card.c-default .ov-val{color:var(--accent)}
-.ov-card.c-ok      .ov-val{color:var(--success)}
-.ov-card.c-warn    .ov-val{color:var(--warn)}
-.ov-card.c-error   .ov-val{color:var(--accent3)}
-
-/* ── Charts ──────────────────────────────────────────────────── */
-.charts-row{
-  display:grid;grid-template-columns:repeat(3,1fr);gap:16px;
-}
-@media(max-width:900px){.charts-row{grid-template-columns:1fr}}
-
-.chart-card{
-  background:var(--surface);
-  border:1px solid var(--border);
-  border-radius:10px;padding:18px;
-  box-shadow:var(--glow);
-}
-.chart-head{
-  display:flex;align-items:baseline;justify-content:space-between;
-  margin-bottom:14px;
-}
-.chart-title{font-size:10px;letter-spacing:0.15em;text-transform:uppercase;color:var(--muted)}
-.chart-live-val{
-  font-family:'Syne',sans-serif;font-size:22px;font-weight:800;
-}
-.chart-live-val.cpu{color:var(--accent)}
-.chart-live-val.mem{color:var(--accent2)}
-.chart-live-val.pods{color:var(--success)}
-canvas{max-height:130px;width:100%!important}
-
-/* ── Table cards ─────────────────────────────────────────────── */
-.tcard{
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:10px;overflow:hidden;box-shadow:var(--glow);
-}
-.tcard-head{
-  padding:13px 18px;
-  border-bottom:1px solid var(--border);
-  display:flex;align-items:center;justify-content:space-between;
-  background:rgba(0,0,0,0.2);
-}
-.tcard-title{font-family:'Syne',sans-serif;font-weight:700;font-size:13px}
-.badge{
-  background:rgba(0,229,255,0.1);color:var(--accent);
-  border:1px solid rgba(0,229,255,0.15);
-  border-radius:20px;padding:2px 10px;font-size:10px;font-weight:600;
-}
-.tscroll{overflow-x:auto}
-table{width:100%;border-collapse:collapse}
-thead th{
-  padding:9px 14px;
-  text-align:left;
-  font-size:9px;letter-spacing:0.15em;text-transform:uppercase;
-  color:var(--muted);
-  background:rgba(0,0,0,0.25);
-  border-bottom:1px solid var(--border);
-  white-space:nowrap;
-  font-weight:600;
-}
-tbody tr{border-bottom:1px solid rgba(24,36,54,0.7);transition:background .12s}
-tbody tr:last-child{border-bottom:none}
-tbody tr:hover{background:rgba(0,229,255,0.03)}
-td{padding:9px 14px;white-space:nowrap;vertical-align:middle}
-
-/* Pills */
-.pill{
-  display:inline-block;padding:2px 9px;border-radius:20px;
-  font-size:9px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;
-}
-.pill-green {background:rgba(0,230,118,.1); color:var(--success)}
-.pill-red   {background:rgba(255,77,125,.1);color:var(--accent3)}
-.pill-yellow{background:rgba(255,170,0,.1); color:var(--warn)}
-.pill-blue  {background:rgba(0,229,255,.08);color:var(--accent)}
-.pill-purple{background:rgba(124,92,252,.1);color:var(--accent2)}
-.pill-gray  {background:rgba(100,120,140,.1);color:var(--muted)}
-
-/* Progress bars */
-.bar-row{display:flex;align-items:center;gap:8px;min-width:120px}
-.bar-track{flex:1;height:5px;background:rgba(255,255,255,0.06);border-radius:3px;overflow:hidden}
-.bar-fill{height:100%;border-radius:3px;transition:width .5s ease}
-.bar-fill.cpu{background:linear-gradient(90deg,var(--accent),var(--accent2))}
-.bar-fill.mem{background:linear-gradient(90deg,var(--accent2),var(--accent3))}
-.bar-fill.danger{background:var(--accent3)!important}
-.bar-fill.warn  {background:var(--warn)!important}
-.bar-pct{font-size:11px;min-width:38px;text-align:right}
-
-/* ── HPA cards ───────────────────────────────────────────────── */
-.hpa-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}
-
-.hpa-card{
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:10px;padding:20px;
-  position:relative;overflow:hidden;
-  box-shadow:var(--glow);
-  transition:border-color .2s;
-}
-.hpa-card:hover{border-color:rgba(124,92,252,0.4)}
-.hpa-card::after{
-  content:'HPA';
-  position:absolute;right:16px;top:16px;
-  font-size:9px;letter-spacing:0.15em;
-  color:rgba(124,92,252,0.3);font-weight:700;
-}
-
-.hpa-name{font-family:'Syne',sans-serif;font-weight:700;font-size:15px;margin-bottom:3px}
-.hpa-meta{font-size:11px;color:var(--muted);margin-bottom:16px;display:flex;align-items:center;gap:8px}
-
-.replica-row{
-  display:grid;grid-template-columns:repeat(4,1fr);
-  border:1px solid var(--border);border-radius:8px;overflow:hidden;
-  margin-bottom:16px;
-}
-.rep-cell{
-  padding:10px 8px;text-align:center;
-  border-right:1px solid var(--border);
-}
-.rep-cell:last-child{border-right:none}
-.rep-num{font-family:'Syne',sans-serif;font-size:22px;font-weight:800;line-height:1;margin-bottom:4px}
-.rep-label{font-size:9px;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted)}
-
-.cpu-row{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:7px}
-.cpu-row strong{color:var(--text)}
-
-/* ── Deployments ─────────────────────────────────────────────── */
-.dep-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
-.dep-card{
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:8px;padding:14px 16px;
-  transition:border-color .2s;
-}
-.dep-card:hover{border-color:rgba(0,229,255,0.2)}
-.dep-name{
-  font-weight:600;font-size:12px;margin-bottom:2px;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.dep-ns{font-size:10px;color:var(--muted);margin-bottom:8px}
-.dep-rep{font-size:11px}
-
-/* ── Toast ───────────────────────────────────────────────────── */
-#toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px}
-.toast{
-  background:var(--surface2);border:1px solid var(--accent);
-  border-radius:8px;padding:11px 16px;
-  font-size:12px;color:var(--accent);
-  box-shadow:0 0 24px rgba(0,229,255,0.15);
-  animation:toastIn .25s ease;
-  max-width:360px;
-}
-@keyframes toastIn{from{transform:translateY(12px);opacity:0}to{transform:translateY(0);opacity:1}}
-
-/* Scrollbar */
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-</style>
-</head>
-<body>
-
-<header>
-  <div class="logo">
-    <div class="logo-icon">K8</div>
-    Control Plane Monitor
-  </div>
-  <div class="header-right">
-    <span id="mode-badge" class="mode-badge mode-mock">⬤ Mock</span>
-    <div class="live-indicator"><div class="live-dot"></div>Live</div>
-    <span id="refresh-time">Starting…</span>
-  </div>
-</header>
-
-<main>
-
-  <!-- Actions -->
-  <div>
-    <div class="sec"><span>⚡</span>Actions</div>
-    <div class="actions">
-      <button class="btn btn-hpa"  onclick="doAction('hpa')">▲ Increase Pod Load (HPA)</button>
-      <button class="btn btn-node" onclick="doAction('node')">▲ Increase Node Stress</button>
-      <button class="btn btn-stop" onclick="doAction('stop')">■ Stop All Stress</button>
-      <button class="btn btn-ref"  onclick="refreshAll()">↻ Refresh Now</button>
-    </div>
-  </div>
-
-  <!-- Cluster Overview -->
-  <div>
-    <div class="sec"><span>📊</span>Cluster Overview</div>
-    <div class="ov-grid">
-      <div class="ov-card c-default"><div class="ov-label">Total Nodes</div>  <div class="ov-val" id="ov-nodes">—</div></div>
-      <div class="ov-card c-ok">    <div class="ov-label">Ready Nodes</div>  <div class="ov-val" id="ov-ready">—</div></div>
-      <div class="ov-card c-default"><div class="ov-label">Total Pods</div>   <div class="ov-val" id="ov-pods">—</div></div>
-      <div class="ov-card c-ok">    <div class="ov-label">Running Pods</div> <div class="ov-val" id="ov-running">—</div></div>
-      <div class="ov-card c-error">  <div class="ov-label">CrashLoop</div>   <div class="ov-val" id="ov-crash">—</div></div>
-      <div class="ov-card c-default"><div class="ov-label">Deployments</div>  <div class="ov-val" id="ov-deps">—</div></div>
-      <div class="ov-card c-default"><div class="ov-label">Services</div>     <div class="ov-val" id="ov-svc">—</div></div>
-      <div class="ov-card c-warn">   <div class="ov-label">HPA Replicas</div><div class="ov-val" id="ov-hpa">—</div></div>
-    </div>
-  </div>
-
-  <!-- Time-series -->
-  <div>
-    <div class="sec"><span>📈</span>Live Time-Series</div>
-    <div class="charts-row">
-      <div class="chart-card">
-        <div class="chart-head">
-          <div class="chart-title">Cluster CPU %</div>
-          <div class="chart-live-val cpu" id="val-cpu">—%</div>
-        </div>
-        <canvas id="chart-cpu"></canvas>
-      </div>
-      <div class="chart-card">
-        <div class="chart-head">
-          <div class="chart-title">Cluster Memory %</div>
-          <div class="chart-live-val mem" id="val-mem">—%</div>
-        </div>
-        <canvas id="chart-mem"></canvas>
-      </div>
-      <div class="chart-card">
-        <div class="chart-head">
-          <div class="chart-title">Total Pod Count</div>
-          <div class="chart-live-val pods" id="val-pods">—</div>
-        </div>
-        <canvas id="chart-pods"></canvas>
-      </div>
-    </div>
-  </div>
-
-  <!-- Nodes -->
-  <div>
-    <div class="sec"><span>🖥</span>Nodes</div>
-    <div class="tcard">
-      <div class="tcard-head">
-        <span class="tcard-title">Node Inventory</span>
-        <span class="badge" id="node-badge">0 nodes</span>
-      </div>
-      <div class="tscroll">
-        <table>
-          <thead><tr>
-            <th>Node</th><th>Role</th><th>CPU %</th><th>Memory %</th>
-            <th>Alloc CPU</th><th>Alloc Mem</th><th>Pods</th><th>Status</th><th>Age</th>
-          </tr></thead>
-          <tbody id="nodes-body"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <!-- Pods -->
-  <div>
-    <div class="sec"><span>📦</span>Pods</div>
-    <div class="tcard">
-      <div class="tcard-head">
-        <span class="tcard-title">Pod Inventory</span>
-        <span class="badge" id="pod-badge">0 pods</span>
-      </div>
-      <div class="tscroll">
-        <table>
-          <thead><tr>
-            <th>Pod</th><th>Namespace</th><th>CPU (m)</th><th>Mem (Mi)</th>
-            <th>Restarts</th><th>Node</th><th>Status</th><th>Age</th>
-          </tr></thead>
-          <tbody id="pods-body"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <!-- HPA -->
-  <div>
-    <div class="sec"><span>⚖</span>Horizontal Pod Autoscalers</div>
-    <div class="hpa-grid" id="hpa-grid">
-      <div class="hpa-card" style="color:var(--muted)">No HPAs found.</div>
-    </div>
-  </div>
-
-  <!-- Deployments -->
-  <div>
-    <div class="sec"><span>🚀</span>Deployments</div>
-    <div class="dep-grid" id="dep-grid"></div>
-  </div>
-
-</main>
-
-<div id="toast-container"></div>
-
-<script>
-// ── Charts ────────────────────────────────────────────────────────────────────
-function makeChart(id, color) {
-  const ctx = document.getElementById(id);
-  return new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [{
-        data: [],
-        borderColor: color,
-        backgroundColor: color.replace('rgb(','rgba(').replace(')',',0.07)'),
-        borderWidth: 2,
-        fill: true,
-        tension: 0.4,
-        pointRadius: 0,
-        pointHoverRadius: 4,
-      }]
-    },
-    options: {
-      animation: { duration: 300 },
-      plugins: { legend: { display: false }, tooltip: {
-        callbacks: { label: ctx => ` ${ctx.parsed.y}` }
-      }},
-      scales: {
-        x: { display: false },
-        y: {
-          min: 0,
-          grid: { color: 'rgba(255,255,255,0.04)', drawBorder: false },
-          ticks: { color: '#3d5570', font: { size: 10, family: 'JetBrains Mono' }, maxTicksLimit: 5 },
-          border: { display: false }
-        }
-      },
-      maintainAspectRatio: true,
-      interaction: { intersect: false, mode: 'index' },
+# ─── Mock Data Generators ──────────────────────────────────────────────────────
+def mock_cluster_overview():
+    return {
+        "total_nodes":       3,
+        "ready_nodes":       3,
+        "total_pods":        18,
+        "running_pods":      16,
+        "crashloop_pods":    1,
+        "total_deployments": 6,
+        "total_services":    8,
+        "hpa_replicas":      4,
+        "mode":              "mock"
     }
-  });
-}
 
-const cpuChart  = makeChart('chart-cpu',  'rgb(0,229,255)');
-const memChart  = makeChart('chart-mem',  'rgb(124,92,252)');
-const podChart  = makeChart('chart-pods', 'rgb(0,230,118)');
+def mock_nodes():
+    names = ["node-master-01", "node-worker-01", "node-worker-02"]
+    roles = ["master", "worker", "worker"]
+    return [
+        {
+            "name":      names[i],
+            "role":      roles[i],
+            "cpu_pct":   round(random.uniform(20, 75), 1),
+            "mem_pct":   round(random.uniform(30, 80), 1),
+            "alloc_cpu": "4000m",
+            "alloc_mem": "8192Mi",
+            "pods":      random.randint(4, 10),
+            "status":    "Ready",
+            "age":       f"{random.randint(1,30)}d",
+        }
+        for i in range(3)
+    ]
 
-function updateChart(chart, labels, values) {
-  chart.data.labels = labels;
-  chart.data.datasets[0].data = values;
-  chart.update('none');
-}
+def mock_pods():
+    namespaces = ["default", "kube-system", "monitoring", "production"]
+    statuses   = ["Running","Running","Running","Running","Pending","Failed"]
+    pod_names  = [
+        "frontend-7d9f8b-xkp2q", "backend-api-5c6d7-mnb3r", "redis-master-0",
+        "postgres-0", "nginx-ingress-controller-abc12", "coredns-74ff55c5b-lkj8m",
+        "metrics-server-6f754f88b-pqrs1", "kube-proxy-node1", "prometheus-0",
+        "grafana-6d96c9f4-zt7vx", "load-generator", "worker-queue-84f9b-rtyu4",
+        "auth-service-3b5f6-nmop2", "mail-service-9c2d1-vwxy5",
+        "scheduler-7a8b9-efgh6", "cache-warmer-1c2d3-ijkl7",
+        "log-aggregator-4e5f6-mnop8", "health-checker-7g8h9-qrst9"
+    ]
+    result = []
+    for i, name in enumerate(pod_names):
+        restarts = random.choices([0, 0, 0, 1, 3, 8], weights=[50,20,10,10,7,3])[0]
+        result.append({
+            "name":      name,
+            "namespace": namespaces[i % len(namespaces)],
+            "cpu_mc":    round(random.uniform(1, 250), 1),
+            "mem_mi":    round(random.uniform(10, 512), 1),
+            "restarts":  restarts,
+            "node":      f"node-worker-0{(i%2)+1}",
+            "status":    statuses[i % len(statuses)],
+            "age":       f"{random.randint(1,48)}h",
+        })
+    return result
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-const get = url => fetch(url).then(r => r.json());
-const last = arr => arr && arr.length ? arr[arr.length - 1] : '—';
+def mock_hpa():
+    return [
+        {
+            "name":             "frontend-hpa",
+            "namespace":        "production",
+            "target":           "frontend",
+            "min_replicas":     1,
+            "max_replicas":     10,
+            "current_replicas": 3,
+            "desired_replicas": 4,
+            "cpu_target_pct":   50,
+            "cpu_current_pct":  67,
+        },
+        {
+            "name":             "backend-hpa",
+            "namespace":        "production",
+            "target":           "backend-api",
+            "min_replicas":     2,
+            "max_replicas":     8,
+            "current_replicas": 2,
+            "desired_replicas": 2,
+            "cpu_target_pct":   60,
+            "cpu_current_pct":  28,
+        },
+    ]
 
-function pill(status) {
-  const map = {
-    Ready:'pill-green', NotReady:'pill-red',
-    Running:'pill-green', Pending:'pill-yellow', Failed:'pill-red',
-    Succeeded:'pill-blue', Unknown:'pill-gray',
-    master:'pill-purple', worker:'pill-blue',
-    production:'pill-purple', default:'pill-blue',
-    'kube-system':'pill-gray', monitoring:'pill-green',
-  };
-  const c = map[status] || 'pill-blue';
-  return `<span class="pill ${c}">${status}</span>`;
-}
+def mock_deployments():
+    items = [
+        ("frontend",      "production", 3, 3),
+        ("backend-api",   "production", 2, 2),
+        ("auth-service",  "production", 2, 1),
+        ("redis",         "default",    1, 1),
+        ("prometheus",    "monitoring", 1, 1),
+        ("grafana",       "monitoring", 1, 1),
+    ]
+    return [{"name":n,"namespace":ns,"desired":d,"ready":r,"available":r} for n,ns,d,r in items]
 
-function bar(pct, cls) {
-  const danger = pct > 80 ? ' danger' : pct > 60 ? ' warn' : '';
-  const color = pct > 80 ? 'var(--accent3)' : pct > 60 ? 'var(--warn)' : 'var(--text)';
-  return `<div class="bar-row">
-    <div class="bar-track">
-      <div class="bar-fill ${cls}${danger}" style="width:${Math.min(pct,100)}%"></div>
-    </div>
-    <span class="bar-pct" style="color:${color}">${pct}%</span>
-  </div>`;
-}
 
-// ── Overview ──────────────────────────────────────────────────────────────────
-async function loadOverview() {
-  const d = await get('/api/cluster-overview');
-  $('ov-nodes').textContent   = d.total_nodes;
-  $('ov-ready').textContent   = d.ready_nodes;
-  $('ov-pods').textContent    = d.total_pods;
-  $('ov-running').textContent = d.running_pods;
-  $('ov-crash').textContent   = d.crashloop_pods;
-  $('ov-deps').textContent    = d.total_deployments;
-  $('ov-svc').textContent     = d.total_services;
-  $('ov-hpa').textContent     = d.hpa_replicas;
+# ─── API Routes ────────────────────────────────────────────────────────────────
+@app.route("/")
+def home():
+    return render_template("index.html")
 
-  const badge = $('mode-badge');
-  if (d.mode === 'live') {
-    badge.textContent = '⬤ Live K8s';
-    badge.className = 'mode-badge mode-live';
-  } else {
-    badge.textContent = '⬤ Mock Data';
-    badge.className = 'mode-badge mode-mock';
-  }
-}
 
-// ── Time-series ───────────────────────────────────────────────────────────────
-async function loadTimeseries() {
-  const d = await get('/api/timeseries');
-  updateChart(cpuChart,  d.timestamps, d.cluster_cpu);
-  updateChart(memChart,  d.timestamps, d.cluster_mem);
-  updateChart(podChart,  d.timestamps, d.pod_count);
-  $('val-cpu').textContent  = `${last(d.cluster_cpu)}%`;
-  $('val-mem').textContent  = `${last(d.cluster_mem)}%`;
-  $('val-pods').textContent = last(d.pod_count);
-}
+@app.route("/api/cluster-overview")
+def cluster_overview():
+    if not K8S_AVAILABLE:
+        return jsonify(mock_cluster_overview())
+    try:
+        pods        = v1.list_pod_for_all_namespaces().items
+        nodes       = v1.list_node().items
+        deployments = apps_v1.list_deployment_for_all_namespaces().items
+        services    = v1.list_service_for_all_namespaces().items
+        running     = sum(1 for p in pods if p.status.phase == "Running")
+        crashloop   = sum(
+            1 for p in pods
+            if p.status.container_statuses and
+            any(cs.state.waiting and cs.state.waiting.reason == "CrashLoopBackOff"
+                for cs in p.status.container_statuses)
+        )
+        ready_nodes = sum(
+            1 for n in nodes
+            if any(c.type == "Ready" and c.status == "True" for c in (n.status.conditions or []))
+        )
+        hpa_replicas = 0
+        try:
+            if HPA_V2:
+                hpas = autoscaling_v2.list_horizontal_pod_autoscaler_for_all_namespaces().items
+            else:
+                hpas = autoscaling_v1.list_horizontal_pod_autoscaler_for_all_namespaces().items
+            hpa_replicas = sum(h.status.current_replicas or 0 for h in hpas)
+        except Exception:
+            pass
+        return jsonify({
+            "total_nodes": len(nodes), "ready_nodes": ready_nodes,
+            "total_pods": len(pods),   "running_pods": running,
+            "crashloop_pods": crashloop, "total_deployments": len(deployments),
+            "total_services": len(services), "hpa_replicas": hpa_replicas,
+            "mode": "live"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-// ── Nodes ─────────────────────────────────────────────────────────────────────
-async function loadNodes() {
-  const nodes = await get('/api/nodes');
-  $('node-badge').textContent = `${nodes.length} node${nodes.length !== 1 ? 's' : ''}`;
-  $('nodes-body').innerHTML = nodes.map(n => `
-    <tr>
-      <td style="font-weight:600;color:var(--text)">${n.name}</td>
-      <td>${pill(n.role)}</td>
-      <td>${bar(n.cpu_pct, 'cpu')}</td>
-      <td>${bar(n.mem_pct, 'mem')}</td>
-      <td style="color:var(--muted)">${n.alloc_cpu}</td>
-      <td style="color:var(--muted)">${n.alloc_mem}</td>
-      <td style="color:var(--accent);font-weight:600">${n.pods}</td>
-      <td>${pill(n.status)}</td>
-      <td style="color:var(--muted)">${n.age}</td>
-    </tr>`).join('');
-}
 
-// ── Pods ──────────────────────────────────────────────────────────────────────
-async function loadPods() {
-  const pods = await get('/api/pods');
-  $('pod-badge').textContent = `${pods.length} pod${pods.length !== 1 ? 's' : ''}`;
-  $('pods-body').innerHTML = pods.map(p => {
-    const rc = p.restarts;
-    const rcColor = rc > 5 ? 'var(--accent3)' : rc > 0 ? 'var(--warn)' : 'var(--muted)';
-    return `<tr>
-      <td style="font-weight:600;color:var(--text);max-width:220px;overflow:hidden;text-overflow:ellipsis" title="${p.name}">${p.name}</td>
-      <td>${pill(p.namespace)}</td>
-      <td style="color:var(--accent)">${p.cpu_mc}m</td>
-      <td style="color:var(--accent2)">${p.mem_mi} Mi</td>
-      <td style="color:${rcColor};font-weight:${rc > 0 ? 700 : 400}">${rc}</td>
-      <td style="color:var(--muted);font-size:11px">${p.node}</td>
-      <td>${pill(p.status)}</td>
-      <td style="color:var(--muted)">${p.age}</td>
-    </tr>`;
-  }).join('');
-}
+@app.route("/api/nodes")
+def nodes_route():
+    if not K8S_AVAILABLE:
+        return jsonify(mock_nodes())
+    try:
+        nodes        = v1.list_node().items
+        node_metrics = {n["metadata"]["name"]: n for n in _node_metrics_raw()}
+        pods_all     = v1.list_pod_for_all_namespaces().items
+        data = []
+        for node in nodes:
+            name = node.metadata.name
+            role = "master" if any(
+                k in (node.metadata.labels or {})
+                for k in ["node-role.kubernetes.io/master","node-role.kubernetes.io/control-plane"]
+            ) else "worker"
+            alloc_cpu = _parse_cpu(node.status.allocatable.get("cpu","0"))
+            alloc_mem = _parse_memory(node.status.allocatable.get("memory","0"))
+            used_cpu = used_mem = 0.0
+            if name in node_metrics:
+                used_cpu = _parse_cpu(node_metrics[name]["usage"]["cpu"])
+                used_mem = _parse_memory(node_metrics[name]["usage"]["memory"])
+            cpu_pct = round(used_cpu / alloc_cpu * 100, 1) if alloc_cpu else 0
+            mem_pct = round(used_mem / alloc_mem * 100, 1) if alloc_mem else 0
+            pods_on_node = sum(1 for p in pods_all if p.spec.node_name == name)
+            ready = any(c.type=="Ready" and c.status=="True" for c in (node.status.conditions or []))
+            age_s = (datetime.datetime.utcnow().replace(tzinfo=None) -
+                     node.metadata.creation_timestamp.replace(tzinfo=None)).total_seconds()
+            age = f"{int(age_s//86400)}d" if age_s > 86400 else f"{int(age_s//3600)}h"
+            data.append({
+                "name": name, "role": role,
+                "cpu_pct": cpu_pct, "mem_pct": mem_pct,
+                "alloc_cpu": f"{int(alloc_cpu)}m", "alloc_mem": f"{int(alloc_mem)}Mi",
+                "pods": pods_on_node, "status": "Ready" if ready else "NotReady", "age": age
+            })
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-// ── HPA ───────────────────────────────────────────────────────────────────────
-async function loadHPA() {
-  const hpas = await get('/api/hpa');
-  if (!Array.isArray(hpas) || hpas.length === 0) return;
-  $('hpa-grid').innerHTML = hpas.map(h => {
-    const ct = h.cpu_target_pct;
-    const cc = h.cpu_current_pct;
-    const fill = (ct && cc) ? Math.min(cc / ct * 100, 100) : 0;
-    const barColor = fill > 90 ? 'var(--accent3)' : fill > 65 ? 'var(--warn)' : 'var(--success)';
-    const scaling = (h.desired_replicas > h.current_replicas) ? '▲ Scaling Up' :
-                    (h.desired_replicas < h.current_replicas) ? '▼ Scaling Down' : '● Stable';
-    const scalingColor = h.desired_replicas !== h.current_replicas ? 'var(--warn)' : 'var(--success)';
-    return `<div class="hpa-card">
-      <div class="hpa-name">${h.name}</div>
-      <div class="hpa-meta">
-        → ${h.target}
-        <span class="pill pill-blue">${h.namespace}</span>
-        <span style="color:${scalingColor};font-size:10px;font-weight:700">${scaling}</span>
-      </div>
-      <div class="replica-row">
-        <div class="rep-cell">
-          <div class="rep-num" style="color:var(--muted)">${h.min_replicas}</div>
-          <div class="rep-label">Min</div>
-        </div>
-        <div class="rep-cell">
-          <div class="rep-num" style="color:var(--accent)">${h.current_replicas}</div>
-          <div class="rep-label">Current</div>
-        </div>
-        <div class="rep-cell">
-          <div class="rep-num" style="color:var(--warn)">${h.desired_replicas}</div>
-          <div class="rep-label">Desired</div>
-        </div>
-        <div class="rep-cell">
-          <div class="rep-num" style="color:var(--muted)">${h.max_replicas}</div>
-          <div class="rep-label">Max</div>
-        </div>
-      </div>
-      <div class="cpu-row">
-        <span>CPU Target: <strong>${ct != null ? ct + '%' : '—'}</strong></span>
-        <span>Current: <strong style="color:${barColor}">${cc != null ? cc + '%' : '—'}</strong></span>
-      </div>
-      <div class="bar-track" style="height:7px">
-        <div class="bar-fill" style="width:${fill}%;background:${barColor};height:100%;border-radius:3px;transition:width .5s"></div>
-      </div>
-    </div>`;
-  }).join('');
-}
 
-// ── Deployments ───────────────────────────────────────────────────────────────
-async function loadDeployments() {
-  const deps = await get('/api/deployments');
-  $('dep-grid').innerHTML = deps.map(d => {
-    const ok = d.ready >= d.desired;
-    return `<div class="dep-card">
-      <div class="dep-name" title="${d.name}">${d.name}</div>
-      <div class="dep-ns">${d.namespace}</div>
-      <div class="dep-rep">
-        <span style="color:${ok?'var(--success)':'var(--warn)'}; font-weight:700">${d.ready}</span>
-        <span style="color:var(--muted)"> / ${d.desired} ready</span>
-      </div>
-    </div>`;
-  }).join('');
-}
+@app.route("/api/pods")
+def pods_route():
+    if not K8S_AVAILABLE:
+        return jsonify(mock_pods())
+    try:
+        pods        = v1.list_pod_for_all_namespaces().items
+        pod_metrics = {
+            f"{p['metadata']['namespace']}/{p['metadata']['name']}": p
+            for p in _pod_metrics_raw()
+        }
+        data = []
+        for pod in pods:
+            key = f"{pod.metadata.namespace}/{pod.metadata.name}"
+            cpu_mc = mem_mi = 0.0
+            if key in pod_metrics:
+                for c in pod_metrics[key].get("containers", []):
+                    cpu_mc += _parse_cpu(c["usage"]["cpu"])
+                    mem_mi += _parse_memory(c["usage"]["memory"])
+            restarts = 0
+            if pod.status.container_statuses:
+                restarts = sum(cs.restart_count for cs in pod.status.container_statuses)
+            age_s = (datetime.datetime.utcnow().replace(tzinfo=None) -
+                     pod.metadata.creation_timestamp.replace(tzinfo=None)).total_seconds()
+            age = f"{int(age_s//3600)}h" if age_s > 3600 else f"{int(age_s//60)}m"
+            data.append({
+                "name": pod.metadata.name, "namespace": pod.metadata.namespace,
+                "cpu_mc": round(cpu_mc,1), "mem_mi": round(mem_mi,1),
+                "restarts": restarts, "node": pod.spec.node_name or "—",
+                "status": pod.status.phase or "Unknown", "age": age
+            })
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-// ── Actions ───────────────────────────────────────────────────────────────────
-async function doAction(type) {
-  const urls = { hpa:'/api/stress-hpa', node:'/api/stress-node', stop:'/api/stop-stress' };
-  try {
-    const r = await fetch(urls[type], { method: 'POST' });
-    const d = await r.json();
-    toast(d.status || d.error || 'Done');
-  } catch(e) {
-    toast('Error: ' + e.message);
-  }
-}
 
-function toast(msg) {
-  const el = document.createElement('div');
-  el.className = 'toast';
-  el.textContent = '✓  ' + msg;
-  $('toast-container').appendChild(el);
-  setTimeout(() => el.remove(), 4000);
-}
+@app.route("/api/hpa")
+def hpa_route():
+    if not K8S_AVAILABLE:
+        return jsonify(mock_hpa())
+    try:
+        data = []
+        if HPA_V2:
+            hpas = autoscaling_v2.list_horizontal_pod_autoscaler_for_all_namespaces().items
+            for h in hpas:
+                cpu_target = cpu_current = None
+                for m in (h.spec.metrics or []):
+                    if m.type=="Resource" and m.resource.name=="cpu":
+                        if m.resource.target.type=="Utilization":
+                            cpu_target = m.resource.target.average_utilization
+                for cm in (h.status.current_metrics or []):
+                    if cm.type=="Resource" and cm.resource.name=="cpu":
+                        cpu_current = cm.resource.current.average_utilization
+                data.append({
+                    "name": h.metadata.name, "namespace": h.metadata.namespace,
+                    "target": h.spec.scale_target_ref.name,
+                    "min_replicas": h.spec.min_replicas, "max_replicas": h.spec.max_replicas,
+                    "current_replicas": h.status.current_replicas,
+                    "desired_replicas": h.status.desired_replicas,
+                    "cpu_target_pct": cpu_target, "cpu_current_pct": cpu_current,
+                })
+        else:
+            hpas = autoscaling_v1.list_horizontal_pod_autoscaler_for_all_namespaces().items
+            for h in hpas:
+                data.append({
+                    "name": h.metadata.name, "namespace": h.metadata.namespace,
+                    "target": h.spec.scale_target_ref.name,
+                    "min_replicas": h.spec.min_replicas, "max_replicas": h.spec.max_replicas,
+                    "current_replicas": h.status.current_replicas,
+                    "desired_replicas": h.status.desired_replicas,
+                    "cpu_target_pct": h.spec.target_cpu_utilization_percentage,
+                    "cpu_current_pct": h.status.current_cpu_utilization_percentage,
+                })
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-// ── Main refresh ──────────────────────────────────────────────────────────────
-async function refreshAll() {
-  await Promise.allSettled([
-    loadOverview(),
-    loadTimeseries(),
-    loadNodes(),
-    loadPods(),
-    loadHPA(),
-    loadDeployments(),
-  ]);
-  $('refresh-time').textContent = 'Updated ' + new Date().toLocaleTimeString();
-}
 
-refreshAll();
-setInterval(refreshAll, 5000);
-</script>
-</body>
-</html>
+@app.route("/api/deployments")
+def deployments_route():
+    if not K8S_AVAILABLE:
+        return jsonify(mock_deployments())
+    try:
+        deps = apps_v1.list_deployment_for_all_namespaces().items
+        return jsonify([{
+            "name": d.metadata.name, "namespace": d.metadata.namespace,
+            "desired": d.spec.replicas, "ready": d.status.ready_replicas or 0,
+            "available": d.status.available_replicas or 0,
+        } for d in deps])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/timeseries")
+def timeseries_route():
+    return jsonify({
+        "timestamps":  list(timeseries["timestamps"]),
+        "cluster_cpu": list(timeseries["cluster_cpu"]),
+        "cluster_mem": list(timeseries["cluster_mem"]),
+        "pod_count":   list(timeseries["pod_count"]),
+    })
+
+
+@app.route("/api/stress-hpa", methods=["POST"])
+def stress_hpa():
+    if not K8S_AVAILABLE:
+        return jsonify({"status": "Mock: HPA load generator started — CPU will spike in charts"})
+    import subprocess
+    subprocess.Popen(
+        "kubectl run load-generator --image=busybox --restart=Never "
+        "-- /bin/sh -c 'while true; do for i in $(seq 1 200); do wget -q -O- http://hpa-service & done; wait; done'",
+        shell=True
+    )
+    return jsonify({"status": "HPA load generator pod started"})
+
+
+@app.route("/api/stress-node", methods=["POST"])
+def stress_node():
+    if not K8S_AVAILABLE:
+        return jsonify({"status": "Mock: Node stress started — memory pressure simulated"})
+    import subprocess
+    subprocess.Popen(
+        "kubectl run node-stressor --image=progrium/stress --restart=Never -- --cpu 4 --timeout 300",
+        shell=True
+    )
+    return jsonify({"status": "Node stress pod started"})
+
+
+@app.route("/api/stop-stress", methods=["POST"])
+def stop_stress():
+    if not K8S_AVAILABLE:
+        return jsonify({"status": "Mock: All stress pods deleted"})
+    import subprocess
+    subprocess.Popen(
+        "kubectl delete pod load-generator node-stressor --ignore-not-found", shell=True
+    )
+    return jsonify({"status": "Stress pods deleted"})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
