@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>K8s Monitoring Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+<h1>Kubernetes Monitoring Dashboard</h1>
+
+<div class="gauge-container">
+    <canvas id="cpuGauge"></canvas>
+</div>
+
+<div class="buttons">
+    <button onclick="stressPod()">Increase Pod Load (HPA)</button>
+    <button onclick="stressNode()">Increase Node Stress</button>
+</div>
+
+<script src="/static/js/dashboard.js"></script>
+
+</body>
+</html>
